@@ -245,7 +245,10 @@ async fn serve_file(path: &StdPath, mime: &str) -> Result<Response, AppError> {
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
     Ok((
-        [(header::CONTENT_TYPE, mime.to_string())],
+        [
+            (header::CONTENT_TYPE, mime.to_string()),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable".to_string()),
+        ],
         body,
     )
         .into_response())
