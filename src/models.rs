@@ -7,7 +7,6 @@ pub struct PhotoRow {
     pub original_filename: String,
     pub mime_type: String,
     pub media_type: String,
-    pub ext: String,
     pub file_size: i64,
     pub width: Option<i64>,
     pub height: Option<i64>,
