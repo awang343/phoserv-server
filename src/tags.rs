@@ -226,6 +226,36 @@ pub async fn rename(pool: &SqlitePool, tag_id: i64, new_name: &str) -> Result<()
     }
 }
 
+pub enum DeleteError {
+    NotFound,
+    Protected,
+    Other(anyhow::Error),
+}
+
+impl<E: Into<anyhow::Error>> From<E> for DeleteError {
+    fn from(err: E) -> Self {
+        DeleteError::Other(err.into())
+    }
+}
+
+/// Deletes a tag everywhere: the tag row, any descendant tags (via
+/// `ON DELETE CASCADE` on `tags.parent_id`), and its associations in
+/// `photo_tags` (via `ON DELETE CASCADE` on `photo_tags.tag_id`) all go in
+/// one statement.
+pub async fn delete(pool: &SqlitePool, tag_id: i64) -> Result<(), DeleteError> {
+    if tag_id == 0 || Some(tag_id) == trash_tag_id(pool).await? {
+        return Err(DeleteError::Protected);
+    }
+    let result = sqlx::query("DELETE FROM tags WHERE id = ?")
+        .bind(tag_id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(DeleteError::NotFound);
+    }
+    Ok(())
+}
+
 pub async fn build_tree(pool: &SqlitePool) -> anyhow::Result<Vec<TagNode>> {
     let all = fetch_all_tags(pool).await?;
     let mut children_of: HashMap<i64, Vec<&TagRow>> = HashMap::new();

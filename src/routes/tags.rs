@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::error::AppError;
 use crate::models::TagNode;
-use crate::tags::RenameError;
+use crate::tags::{DeleteError, RenameError};
 use crate::{tags, AppState};
 
 pub async fn tree(State(state): State<AppState>) -> Result<Json<Vec<TagNode>>, AppError> {
@@ -31,5 +31,14 @@ pub async fn rename(
             Err(AppError::bad_request("a tag with that name already exists under the same parent"))
         }
         Err(RenameError::Other(err)) => Err(err.into()),
+    }
+}
+
+pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<Vec<TagNode>>, AppError> {
+    match tags::delete(&state.pool, id).await {
+        Ok(()) => Ok(Json(tags::build_tree(&state.pool).await?)),
+        Err(DeleteError::NotFound) => Err(AppError::not_found("tag not found")),
+        Err(DeleteError::Protected) => Err(AppError::bad_request("this tag cannot be deleted")),
+        Err(DeleteError::Other(err)) => Err(err.into()),
     }
 }

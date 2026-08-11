@@ -19,5 +19,5 @@ pub fn router() -> Router<AppState> {
             post(photos::add_tags).delete(photos::remove_tags),
         )
         .route("/api/tags", get(tags::tree))
-        .route("/api/tags/{id}", patch(tags::rename))
+        .route("/api/tags/{id}", patch(tags::rename).delete(tags::delete))
 }
