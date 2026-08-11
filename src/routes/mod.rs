@@ -13,6 +13,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/photos/{id}", get(photos::get_one))
         .route("/api/photos/{id}/file", get(photos::get_file))
         .route("/api/photos/{id}/thumbnail", get(photos::get_thumbnail))
+        .route("/api/photos/{id}/regenerate-thumbnail", post(photos::regenerate_thumbnail))
         .route(
             "/api/photos/{id}/tags",
             post(photos::add_tags).delete(photos::remove_tags),

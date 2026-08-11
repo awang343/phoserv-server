@@ -335,6 +335,34 @@ pub async fn get_thumbnail(
     serve_file(&path, "image/jpeg").await
 }
 
+/// Re-runs thumbnail generation for a photo against its stored original.
+/// Unlike upload's best-effort thumbnailing, failures here are surfaced to
+/// the caller since this is an explicit, user-initiated retry.
+pub async fn regenerate_thumbnail(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<Photo>, AppError> {
+    let row: (String, String, String) = sqlx::query_as("SELECT hash, ext, media_type FROM photos WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::not_found("photo not found"))?;
+    let (hash, ext, media_type_str) = row;
+    let media_type = if media_type_str == "video" {
+        media::MediaType::Video
+    } else {
+        media::MediaType::Image
+    };
+
+    let stored_path = storage::original_path(&state.config.library_path, &hash, &ext);
+    let sm_path = storage::thumbnail_path(&state.config.library_path, &hash, "sm");
+    let md_path = storage::thumbnail_path(&state.config.library_path, &hash, "md");
+
+    media::generate_thumbnail(&stored_path, &sm_path, media_type, 320).await?;
+    media::generate_thumbnail(&stored_path, &md_path, media_type, 1280).await?;
+
+    let photo_row = fetch_photo_row(&state, &id).await?;
+    let tag_list = tags::tags_for_photo(&state.pool, &id).await?;
+    Ok(Json(Photo::from_row(photo_row, tag_list)))
+}
+
 #[derive(Deserialize)]
 pub struct TagsBody {
     tags: Vec<String>,
