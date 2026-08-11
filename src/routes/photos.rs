@@ -96,8 +96,16 @@ pub async fn upload(
 
             let sm_path = storage::thumbnail_path(&state.config.library_path, &hash, "sm");
             let md_path = storage::thumbnail_path(&state.config.library_path, &hash, "md");
-            media::generate_thumbnail(&stored_path, &sm_path, media_type, 320).await?;
-            media::generate_thumbnail(&stored_path, &md_path, media_type, 1280).await?;
+            // Thumbnailing is best-effort: some sources (e.g. codecs the local
+            // ffmpeg build can't decode) will fail here, but that shouldn't
+            // block storing the upload itself. Photos without a thumbnail on
+            // disk just 404 on `/thumbnail` (handled gracefully by the client).
+            if let Err(err) = media::generate_thumbnail(&stored_path, &sm_path, media_type, 320).await {
+                tracing::warn!("thumbnail generation failed for {hash} (sm): {err:#}");
+            }
+            if let Err(err) = media::generate_thumbnail(&stored_path, &md_path, media_type, 1280).await {
+                tracing::warn!("thumbnail generation failed for {hash} (md): {err:#}");
+            }
 
             let id = Uuid::new_v4().to_string();
             let file_size = bytes.len() as i64;
@@ -246,6 +254,21 @@ pub async fn list(
         .collect();
 
     Ok(Json(ListResponse { photos, total, limit, next_cursor }))
+}
+
+/// Looks up a photo by its content hash (SHA-256 of the original file
+/// bytes), the same hash `upload` computes for dedup. Lets clients check
+/// whether a file already exists before spending bandwidth uploading it.
+pub async fn get_by_hash(State(state): State<AppState>, Path(hash): Path<String>) -> Result<Json<Photo>, AppError> {
+    let row: PhotoRow = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {PHOTO_COLUMNS} FROM photos WHERE hash = ?"
+    )))
+    .bind(&hash)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("photo not found"))?;
+    let tag_list = tags::tags_for_photo(&state.pool, &row.id).await?;
+    Ok(Json(Photo::from_row(row, tag_list)))
 }
 
 async fn fetch_photo_row(state: &AppState, id: &str) -> Result<PhotoRow, AppError> {

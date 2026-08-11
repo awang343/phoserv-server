@@ -9,6 +9,7 @@ use crate::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/photos", post(photos::upload).get(photos::list))
+        .route("/api/photos/by-hash/{hash}", get(photos::get_by_hash))
         .route("/api/photos/{id}", get(photos::get_one))
         .route("/api/photos/{id}/file", get(photos::get_file))
         .route("/api/photos/{id}/thumbnail", get(photos::get_thumbnail))
