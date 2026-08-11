@@ -10,8 +10,11 @@ mod tags;
 
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::Router;
+
+const MAX_UPLOAD_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
 use sqlx::SqlitePool;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -49,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .with_state(state.clone());
 
     let addr = format!("{}:{}", state.config.host, state.config.port);
