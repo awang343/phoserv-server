@@ -144,7 +144,7 @@ pub async fn upload(
 pub struct ListQuery {
     tag: Option<String>,
     limit: Option<i64>,
-    offset: Option<i64>,
+    cursor: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -152,7 +152,19 @@ pub struct ListResponse {
     photos: Vec<Photo>,
     total: i64,
     limit: i64,
-    offset: i64,
+    next_cursor: Option<String>,
+}
+
+/// Cursors are opaque to clients: a `(created_at, id)` pair identifying the
+/// last row of the previous page. Ordering by this pair (instead of a numeric
+/// OFFSET) keeps pagination stable even as new photos are inserted concurrently.
+fn encode_cursor(created_at: &str, id: &str) -> String {
+    format!("{created_at}|{id}")
+}
+
+fn decode_cursor(cursor: &str) -> Result<(String, String), AppError> {
+    let (created_at, id) = cursor.split_once('|').ok_or_else(|| AppError::bad_request("invalid cursor"))?;
+    Ok((created_at.to_string(), id.to_string()))
 }
 
 pub async fn list(
@@ -160,7 +172,9 @@ pub async fn list(
     Query(q): Query<ListQuery>,
 ) -> Result<Json<ListResponse>, AppError> {
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
-    let offset = q.offset.unwrap_or(0).max(0);
+    let fetch_limit = limit + 1;
+    let cursor = q.cursor.as_deref().map(decode_cursor).transpose()?;
+    let cursor_clause = "created_at < ? OR (created_at = ? AND id < ?)";
 
     let tag_ids: Option<Vec<i64>> = match &q.tag {
         Some(path) => match tags::find_by_path(&state.pool, path).await? {
@@ -170,7 +184,7 @@ pub async fn list(
         None => None,
     };
 
-    let (rows, total): (Vec<PhotoRow>, i64) = match &tag_ids {
+    let (mut rows, total): (Vec<PhotoRow>, i64) = match &tag_ids {
         Some(ids) if ids.is_empty() => (vec![], 0),
         Some(ids) => {
             let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
@@ -184,31 +198,41 @@ pub async fn list(
             }
             let (total,) = cq.fetch_one(&state.pool).await?;
 
+            let cursor_sql = if cursor.is_some() { format!("AND ({cursor_clause})") } else { String::new() };
             let list_query = format!(
-                "SELECT DISTINCT p.{} FROM photos p JOIN photo_tags pt ON pt.photo_id = p.id WHERE pt.tag_id IN ({placeholders}) ORDER BY p.created_at DESC LIMIT ? OFFSET ?",
+                "SELECT DISTINCT p.{} FROM photos p JOIN photo_tags pt ON pt.photo_id = p.id WHERE pt.tag_id IN ({placeholders}) {cursor_sql} ORDER BY p.created_at DESC, p.id DESC LIMIT ?",
                 PHOTO_COLUMNS.replace(", ", ", p.")
             );
             let mut lq = sqlx::query_as::<_, PhotoRow>(sqlx::AssertSqlSafe(list_query));
             for id in ids {
                 lq = lq.bind(id);
             }
-            let rows = lq.bind(limit).bind(offset).fetch_all(&state.pool).await?;
+            if let Some((created_at, id)) = &cursor {
+                lq = lq.bind(created_at).bind(created_at).bind(id);
+            }
+            let rows = lq.bind(fetch_limit).fetch_all(&state.pool).await?;
             (rows, total)
         }
         None => {
             let (total,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM photos")
                 .fetch_one(&state.pool)
                 .await?;
-            let rows: Vec<PhotoRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                "SELECT {PHOTO_COLUMNS} FROM photos ORDER BY created_at DESC LIMIT ? OFFSET ?"
-            )))
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&state.pool)
-            .await?;
+
+            let cursor_sql = if cursor.is_some() { format!("WHERE {cursor_clause}") } else { String::new() };
+            let mut lq = sqlx::query_as::<_, PhotoRow>(sqlx::AssertSqlSafe(format!(
+                "SELECT {PHOTO_COLUMNS} FROM photos {cursor_sql} ORDER BY created_at DESC, id DESC LIMIT ?"
+            )));
+            if let Some((created_at, id)) = &cursor {
+                lq = lq.bind(created_at).bind(created_at).bind(id);
+            }
+            let rows = lq.bind(fetch_limit).fetch_all(&state.pool).await?;
             (rows, total)
         }
     };
+
+    let has_more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    let next_cursor = has_more.then(|| rows.last().map(|r| encode_cursor(&r.created_at, &r.id))).flatten();
 
     let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
     let mut tag_map = tags::tags_for_photos(&state.pool, &ids).await?;
@@ -221,7 +245,7 @@ pub async fn list(
         })
         .collect();
 
-    Ok(Json(ListResponse { photos, total, limit, offset }))
+    Ok(Json(ListResponse { photos, total, limit, next_cursor }))
 }
 
 async fn fetch_photo_row(state: &AppState, id: &str) -> Result<PhotoRow, AppError> {

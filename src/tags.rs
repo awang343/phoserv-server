@@ -179,6 +179,42 @@ pub async fn tags_for_photos(
     Ok(result)
 }
 
+pub enum RenameError {
+    InvalidName,
+    NotFound,
+    NameConflict,
+    Other(anyhow::Error),
+}
+
+impl<E: Into<anyhow::Error>> From<E> for RenameError {
+    fn from(err: E) -> Self {
+        RenameError::Other(err.into())
+    }
+}
+
+/// Renames a tag in place, keeping its parent and children unchanged.
+pub async fn rename(pool: &SqlitePool, tag_id: i64, new_name: &str) -> Result<(), RenameError> {
+    let name = new_name.trim();
+    if name.is_empty() || name.contains('/') || tag_id == 0 {
+        return Err(RenameError::InvalidName);
+    }
+
+    let result = sqlx::query("UPDATE tags SET name = ? WHERE id = ?")
+        .bind(name)
+        .bind(tag_id)
+        .execute(pool)
+        .await;
+
+    match result {
+        Ok(res) if res.rows_affected() == 0 => Err(RenameError::NotFound),
+        Ok(_) => Ok(()),
+        Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+            Err(RenameError::NameConflict)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub async fn build_tree(pool: &SqlitePool) -> anyhow::Result<Vec<TagNode>> {
     let all = fetch_all_tags(pool).await?;
     let mut children_of: HashMap<i64, Vec<&TagRow>> = HashMap::new();

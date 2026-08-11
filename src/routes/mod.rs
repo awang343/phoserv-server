@@ -1,7 +1,7 @@
 mod photos;
 mod tags;
 
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::Router;
 
 use crate::AppState;
@@ -17,4 +17,5 @@ pub fn router() -> Router<AppState> {
             post(photos::add_tags).delete(photos::remove_tags),
         )
         .route("/api/tags", get(tags::tree))
+        .route("/api/tags/{id}", patch(tags::rename))
 }
