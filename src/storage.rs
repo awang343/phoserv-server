@@ -25,3 +25,22 @@ pub async fn store_original(library_path: &Path, hash: &str, ext: &str, bytes: &
     Ok(path)
 }
 
+async fn remove_if_exists(path: &Path) -> anyhow::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub async fn delete_original(library_path: &Path, hash: &str, ext: &str) -> anyhow::Result<()> {
+    remove_if_exists(&original_path(library_path, hash, ext)).await
+}
+
+pub async fn delete_thumbnails(library_path: &Path, hash: &str) -> anyhow::Result<()> {
+    for size in ["sm", "md"] {
+        remove_if_exists(&thumbnail_path(library_path, hash, size)).await?;
+    }
+    Ok(())
+}
+

@@ -4,6 +4,17 @@ use sqlx::SqlitePool;
 
 use crate::models::TagNode;
 
+/// Reserved top-level tag used to mark photos as soft-deleted ("trash").
+/// Excluded from the tag tree and autocomplete suggestions so it doesn't
+/// appear alongside user-created tags.
+pub const TRASH_TAG: &str = "trash";
+
+/// Resolves the trash tag's id, if it has ever been created (i.e. at least
+/// one photo has been trashed).
+pub async fn trash_tag_id(pool: &SqlitePool) -> anyhow::Result<Option<i64>> {
+    find_by_path(pool, TRASH_TAG).await
+}
+
 /// Splits a tag path like "people/alice" into trimmed, non-empty segments.
 pub fn split_path(path: &str) -> Vec<&str> {
     path.split('/').map(str::trim).filter(|s| !s.is_empty()).collect()
@@ -226,6 +237,9 @@ pub async fn build_tree(pool: &SqlitePool) -> anyhow::Result<Vec<TagNode>> {
         let mut nodes = Vec::new();
         if let Some(children) = children_of.get(&parent_id) {
             for tag in children {
+                if parent_id == 0 && tag.name == TRASH_TAG {
+                    continue;
+                }
                 let path = if parent_path.is_empty() {
                     tag.name.clone()
                 } else {

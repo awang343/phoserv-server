@@ -153,6 +153,8 @@ pub struct ListQuery {
     tag: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
+    #[serde(default)]
+    trash: bool,
 }
 
 #[derive(Serialize)]
@@ -184,36 +186,57 @@ pub async fn list(
     let cursor = q.cursor.as_deref().map(decode_cursor).transpose()?;
     let cursor_clause = "created_at < ? OR (created_at = ? AND id < ?)";
 
-    let tag_ids: Option<Vec<i64>> = match &q.tag {
-        Some(path) => match tags::find_by_path(&state.pool, path).await? {
-            Some(id) => Some(tags::descendant_ids(&state.pool, id).await?),
-            None => Some(vec![]),
-        },
-        None => None,
+    // Trashed photos (tagged with the reserved `trash` tag) are excluded from
+    // every normal view; `?trash=true` flips that to show only trash
+    // contents, ignoring any `?tag` filter.
+    let trash_tag_id = tags::trash_tag_id(&state.pool).await?;
+    let exclude_tag_id: Option<i64> = if q.trash { None } else { trash_tag_id };
+
+    let tag_ids: Option<Vec<i64>> = if q.trash {
+        Some(trash_tag_id.into_iter().collect())
+    } else {
+        match &q.tag {
+            Some(path) => match tags::find_by_path(&state.pool, path).await? {
+                Some(id) => Some(tags::descendant_ids(&state.pool, id).await?),
+                None => Some(vec![]),
+            },
+            None => None,
+        }
     };
 
     let (mut rows, total): (Vec<PhotoRow>, i64) = match &tag_ids {
         Some(ids) if ids.is_empty() => (vec![], 0),
         Some(ids) => {
             let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let exclude_sql = if exclude_tag_id.is_some() {
+                "AND NOT EXISTS (SELECT 1 FROM photo_tags ptx WHERE ptx.photo_id = p.id AND ptx.tag_id = ?)"
+            } else {
+                ""
+            };
 
             let count_query = format!(
-                "SELECT COUNT(DISTINCT p.id) FROM photos p JOIN photo_tags pt ON pt.photo_id = p.id WHERE pt.tag_id IN ({placeholders})"
+                "SELECT COUNT(DISTINCT p.id) FROM photos p JOIN photo_tags pt ON pt.photo_id = p.id WHERE pt.tag_id IN ({placeholders}) {exclude_sql}"
             );
             let mut cq = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(count_query));
             for id in ids {
                 cq = cq.bind(id);
             }
+            if let Some(ex) = exclude_tag_id {
+                cq = cq.bind(ex);
+            }
             let (total,) = cq.fetch_one(&state.pool).await?;
 
             let cursor_sql = if cursor.is_some() { format!("AND ({cursor_clause})") } else { String::new() };
             let list_query = format!(
-                "SELECT DISTINCT p.{} FROM photos p JOIN photo_tags pt ON pt.photo_id = p.id WHERE pt.tag_id IN ({placeholders}) {cursor_sql} ORDER BY p.created_at DESC, p.id DESC LIMIT ?",
+                "SELECT DISTINCT p.{} FROM photos p JOIN photo_tags pt ON pt.photo_id = p.id WHERE pt.tag_id IN ({placeholders}) {exclude_sql} {cursor_sql} ORDER BY p.created_at DESC, p.id DESC LIMIT ?",
                 PHOTO_COLUMNS.replace(", ", ", p.")
             );
             let mut lq = sqlx::query_as::<_, PhotoRow>(sqlx::AssertSqlSafe(list_query));
             for id in ids {
                 lq = lq.bind(id);
+            }
+            if let Some(ex) = exclude_tag_id {
+                lq = lq.bind(ex);
             }
             if let Some((created_at, id)) = &cursor {
                 lq = lq.bind(created_at).bind(created_at).bind(id);
@@ -222,14 +245,41 @@ pub async fn list(
             (rows, total)
         }
         None => {
-            let (total,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM photos")
-                .fetch_one(&state.pool)
-                .await?;
+            let exclude_sql = if exclude_tag_id.is_some() {
+                "NOT EXISTS (SELECT 1 FROM photo_tags ptx WHERE ptx.photo_id = photos.id AND ptx.tag_id = ?)"
+            } else {
+                ""
+            };
+            let mut conditions: Vec<&str> = Vec::new();
+            if exclude_tag_id.is_some() {
+                conditions.push(exclude_sql);
+            }
+            if cursor.is_some() {
+                conditions.push(cursor_clause);
+            }
+            let where_sql = if conditions.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {}", conditions.join(" AND "))
+            };
 
-            let cursor_sql = if cursor.is_some() { format!("WHERE {cursor_clause}") } else { String::new() };
+            let count_query = format!("SELECT COUNT(*) FROM photos {}", if exclude_tag_id.is_some() {
+                format!("WHERE {exclude_sql}")
+            } else {
+                String::new()
+            });
+            let mut cq = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(count_query));
+            if let Some(ex) = exclude_tag_id {
+                cq = cq.bind(ex);
+            }
+            let (total,) = cq.fetch_one(&state.pool).await?;
+
             let mut lq = sqlx::query_as::<_, PhotoRow>(sqlx::AssertSqlSafe(format!(
-                "SELECT {PHOTO_COLUMNS} FROM photos {cursor_sql} ORDER BY created_at DESC, id DESC LIMIT ?"
+                "SELECT {PHOTO_COLUMNS} FROM photos {where_sql} ORDER BY created_at DESC, id DESC LIMIT ?"
             )));
+            if let Some(ex) = exclude_tag_id {
+                lq = lq.bind(ex);
+            }
             if let Some((created_at, id)) = &cursor {
                 lq = lq.bind(created_at).bind(created_at).bind(id);
             }
@@ -283,6 +333,38 @@ pub async fn get_one(State(state): State<AppState>, Path(id): Path<String>) -> R
     let row = fetch_photo_row(&state, &id).await?;
     let tag_list = tags::tags_for_photo(&state.pool, &id).await?;
     Ok(Json(Photo::from_row(row, tag_list)))
+}
+
+/// Permanently deletes a photo: removes its DB row (cascading photo_tags)
+/// and best-effort removes the original + thumbnails from disk. Only allowed
+/// once a photo has already been moved to trash, so this can't be triggered
+/// as a direct, un-recoverable action from the main library view.
+pub async fn delete_permanently(State(state): State<AppState>, Path(id): Path<String>) -> Result<StatusCode, AppError> {
+    let row: (String, String) = sqlx::query_as("SELECT hash, ext FROM photos WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::not_found("photo not found"))?;
+    let (hash, ext) = row;
+
+    let tag_list = tags::tags_for_photo(&state.pool, &id).await?;
+    if !tag_list.iter().any(|t| t == tags::TRASH_TAG) {
+        return Err(AppError::bad_request("photo must be moved to trash before it can be permanently deleted"));
+    }
+
+    sqlx::query("DELETE FROM photos WHERE id = ?")
+        .bind(&id)
+        .execute(&state.pool)
+        .await?;
+
+    if let Err(err) = storage::delete_original(&state.config.library_path, &hash, &ext).await {
+        tracing::warn!("failed to delete original file for {hash}: {err:#}");
+    }
+    if let Err(err) = storage::delete_thumbnails(&state.config.library_path, &hash).await {
+        tracing::warn!("failed to delete thumbnails for {hash}: {err:#}");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn serve_file(path: &StdPath, mime: &str) -> Result<Response, AppError> {
