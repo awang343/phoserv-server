@@ -22,7 +22,7 @@ use tower_http::trace::TraceLayer;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
-    pub config: Arc<config::Config>,
+    pub config: Arc<config::ServerConfig>,
 }
 
 #[tokio::main]
@@ -35,6 +35,20 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = config::Config::load()?;
+    let servers = config.into_servers();
+
+    let mut set = tokio::task::JoinSet::new();
+    for server_config in servers {
+        set.spawn(run_server(server_config));
+    }
+
+    while let Some(result) = set.join_next().await {
+        result??;
+    }
+    Ok(())
+}
+
+async fn run_server(config: config::ServerConfig) -> anyhow::Result<()> {
     tracing::info!("using library at {}", config.library_path.display());
 
     let pool = db::connect(&config.library_path).await?;
