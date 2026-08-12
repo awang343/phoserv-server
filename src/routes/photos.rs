@@ -486,3 +486,97 @@ pub async fn remove_tags(
     let tag_list = tags::tags_for_photo(&state.pool, &id).await?;
     Ok(Json(Photo::from_row(row, tag_list)))
 }
+
+async fn fetch_photos(state: &AppState, ids: &[String]) -> Result<Vec<Photo>, AppError> {
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let query = format!("SELECT {PHOTO_COLUMNS} FROM photos WHERE id IN ({placeholders})");
+    let mut q = sqlx::query_as::<_, PhotoRow>(sqlx::AssertSqlSafe(query));
+    for id in ids {
+        q = q.bind(id);
+    }
+    let rows = q.fetch_all(&state.pool).await?;
+    let mut tag_map = tags::tags_for_photos(&state.pool, ids).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let tag_list = tag_map.remove(&row.id).unwrap_or_default();
+            Photo::from_row(row, tag_list)
+        })
+        .collect())
+}
+
+#[derive(Deserialize)]
+pub struct BulkTagsBody {
+    photo_ids: Vec<String>,
+    tags: Vec<String>,
+}
+
+pub async fn bulk_add_tags(
+    State(state): State<AppState>,
+    Json(body): Json<BulkTagsBody>,
+) -> Result<Json<Vec<Photo>>, AppError> {
+    let mut tag_ids = Vec::with_capacity(body.tags.len());
+    for path in &body.tags {
+        tag_ids.push(tags::resolve_or_create(&state.pool, path).await?);
+    }
+    for id in &body.photo_ids {
+        for tag_id in &tag_ids {
+            sqlx::query("INSERT OR IGNORE INTO photo_tags (photo_id, tag_id) VALUES (?, ?)")
+                .bind(id)
+                .bind(tag_id)
+                .execute(&state.pool)
+                .await?;
+        }
+    }
+    Ok(Json(fetch_photos(&state, &body.photo_ids).await?))
+}
+
+#[derive(Deserialize)]
+pub struct BulkDeleteBody {
+    photo_ids: Vec<String>,
+}
+
+/// Permanently deletes multiple photos in one request. Like the single-photo
+/// version, every id must already carry the trash tag; if any doesn't, the
+/// whole request is rejected before anything is deleted.
+pub async fn bulk_delete_permanently(
+    State(state): State<AppState>,
+    Json(body): Json<BulkDeleteBody>,
+) -> Result<StatusCode, AppError> {
+    let mut to_delete: Vec<(String, String)> = Vec::with_capacity(body.photo_ids.len());
+    for id in &body.photo_ids {
+        let row: (String, String) = sqlx::query_as("SELECT hash, ext FROM photos WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| AppError::not_found(format!("photo not found: {id}")))?;
+        let tag_list = tags::tags_for_photo(&state.pool, id).await?;
+        if !tag_list.iter().any(|t| t == tags::TRASH_TAG) {
+            return Err(AppError::bad_request(
+                "all photos must be moved to trash before they can be permanently deleted",
+            ));
+        }
+        to_delete.push(row);
+    }
+
+    for id in &body.photo_ids {
+        sqlx::query("DELETE FROM photos WHERE id = ?")
+            .bind(id)
+            .execute(&state.pool)
+            .await?;
+    }
+
+    for (hash, ext) in &to_delete {
+        if let Err(err) = storage::delete_original(&state.config.library_path, hash, ext).await {
+            tracing::warn!("failed to delete original file for {hash}: {err:#}");
+        }
+        if let Err(err) = storage::delete_thumbnails(&state.config.library_path, hash).await {
+            tracing::warn!("failed to delete thumbnails for {hash}: {err:#}");
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
