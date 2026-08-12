@@ -11,6 +11,7 @@ mod tags;
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::middleware;
 use axum::Router;
 
@@ -61,10 +62,13 @@ async fn run_server(config: config::ServerConfig) -> anyhow::Result<()> {
         .merge(api)
         .layer(TraceLayer::new_for_http())
         .layer(
+            // A wildcard `Access-Control-Allow-Headers: *` doesn't cover
+            // `Authorization` per the fetch spec, so every authenticated
+            // request would fail CORS — it must be listed explicitly.
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
-                .allow_headers(Any),
+                .allow_headers([AUTHORIZATION, CONTENT_TYPE]),
         )
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .with_state(state.clone());
