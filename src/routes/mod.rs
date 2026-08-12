@@ -1,7 +1,8 @@
+mod galleries;
 mod photos;
 mod tags;
 
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch, post, put};
 use axum::Router;
 
 use crate::AppState;
@@ -22,4 +23,23 @@ pub fn router() -> Router<AppState> {
         .route("/api/photos/bulk-delete", post(photos::bulk_delete_permanently))
         .route("/api/tags", get(tags::tree))
         .route("/api/tags/{id}", patch(tags::rename).delete(tags::delete))
+        .route("/api/galleries", get(galleries::list).post(galleries::create))
+        .route(
+            "/api/galleries/{id}",
+            get(galleries::get_one).patch(galleries::update).delete(galleries::delete),
+        )
+        .route(
+            "/api/galleries/{id}/photos",
+            post(galleries::add_photos).delete(galleries::remove_photos),
+        )
+        .route("/api/galleries/{id}/order", put(galleries::reorder))
+        .route(
+            "/api/galleries/{id}/tags",
+            post(galleries::add_tags).delete(galleries::remove_tags),
+        )
+        .route("/api/gallery-tags", get(galleries::tag_tree))
+        .route(
+            "/api/gallery-tags/{id}",
+            patch(galleries::rename_tag).delete(galleries::delete_tag),
+        )
 }

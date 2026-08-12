@@ -2,6 +2,8 @@ mod auth;
 mod config;
 mod db;
 mod error;
+mod gallery;
+mod gallery_tags;
 mod media;
 mod models;
 mod routes;

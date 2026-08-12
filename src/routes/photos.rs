@@ -11,10 +11,8 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::models::{Photo, PhotoRow};
+use crate::models::{Photo, PhotoRow, PHOTO_COLUMNS};
 use crate::{media, storage, tags, AppState};
-
-const PHOTO_COLUMNS: &str = "id, hash, original_filename, mime_type, media_type, file_size, width, height, duration_seconds, taken_at, created_at";
 
 fn extension_for(filename: &str, mime_type: &str) -> String {
     if let Some(ext) = StdPath::new(filename).extension().and_then(|e| e.to_str()) {

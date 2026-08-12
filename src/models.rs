@@ -1,5 +1,7 @@
 use serde::Serialize;
 
+pub const PHOTO_COLUMNS: &str = "id, hash, original_filename, mime_type, media_type, file_size, width, height, duration_seconds, taken_at, created_at";
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct PhotoRow {
     pub id: String,
@@ -56,4 +58,29 @@ pub struct TagNode {
     pub name: String,
     pub path: String,
     pub children: Vec<TagNode>,
+}
+
+/// A gallery as shown in list views: metadata plus derived fields (page
+/// count, cover) computed from its member photos rather than stored.
+#[derive(Debug, Serialize)]
+pub struct Gallery {
+    pub id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub cover_photo_id: Option<String>,
+    pub photo_count: i64,
+    pub tags: Vec<String>,
+    pub created_at: String,
+}
+
+/// A single gallery with its full, ordered page list — what the gallery
+/// viewer/reader fetches.
+#[derive(Debug, Serialize)]
+pub struct GalleryDetail {
+    pub id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub tags: Vec<String>,
+    pub created_at: String,
+    pub photos: Vec<Photo>,
 }
