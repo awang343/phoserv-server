@@ -19,6 +19,11 @@ Add --fix to push any missing tags to phoserv via POST /api/photos/{id}/tags
 (this does not touch Hydrus and never uploads files -- it only adds tags to
 photos that already exist on the server).
 
+Add --interactive-sync to be prompted on each mismatch, with the option to
+force phoserv's tags to match Hydrus exactly for that photo -- adding
+missing tags (POST) and removing extra ones (DELETE). Mutually exclusive
+with --fix; processes files sequentially so prompts don't interleave.
+
 Both keys can also be supplied via the HYDRUS_API_KEY / PHOSERV_API_TOKEN
 env vars.
 """
@@ -99,6 +104,14 @@ class PhoservClient:
         )
         r.raise_for_status()
 
+    def remove_tags(self, photo_id: str, tags: list[str]) -> None:
+        r = self.session.delete(
+            f"{self.base_url}/api/photos/{photo_id}/tags",
+            json={"tags": tags},
+            timeout=30,
+        )
+        r.raise_for_status()
+
 
 def current_tags(metadata: dict, include_pending: bool) -> list[str]:
     statuses = {"0"} | ({"1"} if include_pending else set())
@@ -125,14 +138,54 @@ def chunked(items: list, size: int):
         yield items[i : i + size]
 
 
+class SyncState:
+    """Shared across --interactive-sync prompts so 'all'/'quit' persist between files."""
+
+    def __init__(self):
+        self.mode = "ask"  # "ask" | "all" | "quit"
+
+
+def prompt_sync(sync_state: SyncState, file_hash: str, photo_id: str, missing: set[str], extra: set[str]) -> bool:
+    if sync_state.mode == "quit":
+        return False
+    if sync_state.mode == "all":
+        return True
+
+    parts = []
+    if missing:
+        parts.append(f"add={sorted(missing)}")
+    if extra:
+        parts.append(f"remove={sorted(extra)}")
+    prompt = f"sync {file_hash} (id={photo_id}) {' '.join(parts)}? [y/N/a=all/q=quit]: "
+
+    while True:
+        try:
+            ans = input(prompt).strip().lower()
+        except EOFError:
+            sync_state.mode = "quit"
+            return False
+        if ans in ("y", "yes"):
+            return True
+        if ans in ("", "n", "no"):
+            return False
+        if ans in ("a", "all"):
+            sync_state.mode = "all"
+            return True
+        if ans in ("q", "quit"):
+            sync_state.mode = "quit"
+            return False
+        print("please answer y, n, a, or q", file=sys.stderr)
+
+
 def check_one(
     phoserv: PhoservClient,
     metadata: dict,
     flatten_namespace: bool,
     include_pending: bool,
     fix: bool,
+    sync_state: SyncState | None,
 ) -> str:
-    """Returns one of: 'ok', 'missing', 'not_uploaded', 'error'."""
+    """Returns one of: 'ok', 'missing', 'not_uploaded', 'synced', 'error'."""
     file_hash = metadata["hash"]
     expected = set(to_tag_path(t, flatten_namespace) for t in current_tags(metadata, include_pending))
 
@@ -159,6 +212,20 @@ def check_one(
     if extra:
         parts.append(f"extra={sorted(extra)}")
     log(f"MISMATCH {file_hash} (id={photo['id']}): {' '.join(parts)}")
+
+    if sync_state is not None:
+        if not prompt_sync(sync_state, file_hash, photo["id"], missing, extra):
+            return "missing"
+        try:
+            if missing:
+                phoserv.add_tags(photo["id"], sorted(missing))
+            if extra:
+                phoserv.remove_tags(photo["id"], sorted(extra))
+            log(f"  synced: added {len(missing)}, removed {len(extra)} tag(s) on {photo['id']}")
+            return "synced"
+        except requests.RequestException as e:
+            log(f"  FAILED to sync {photo['id']}: {e}")
+            return "error"
 
     if fix and missing:
         try:
@@ -189,12 +256,23 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=None, help="only check the first N files (for testing)")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--fix", action="store_true", help="push missing tags to phoserv for photos that already exist there")
+    parser.add_argument(
+        "--interactive-sync",
+        action="store_true",
+        help=(
+            "for each mismatch, prompt [y/N/a=all/q=quit] to force phoserv's tags to match "
+            "Hydrus exactly (adds missing tags and removes extra ones). Mutually exclusive "
+            "with --fix; runs sequentially so prompts don't interleave (--workers is ignored)"
+        ),
+    )
     args = parser.parse_args()
 
     if not args.hydrus_key:
         parser.error("--hydrus-key or HYDRUS_API_KEY is required")
     if not args.server_token:
         parser.error("--server-token or PHOSERV_API_TOKEN is required")
+    if args.fix and args.interactive_sync:
+        parser.error("--fix and --interactive-sync are mutually exclusive")
 
     search_tags = args.tags or ["system:everything"]
 
@@ -215,18 +293,30 @@ def main() -> int:
     for batch in chunked(hashes, HASH_BATCH_SIZE):
         metadatas.extend(hydrus.file_metadata(batch))
 
-    counts = {"ok": 0, "missing": 0, "not_uploaded": 0, "error": 0}
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = [
-            pool.submit(check_one, phoserv, m, args.flatten_namespace, args.include_pending, args.fix)
-            for m in metadatas
-        ]
-        for fut in as_completed(futures):
-            counts[fut.result()] += 1
+    counts = {"ok": 0, "missing": 0, "not_uploaded": 0, "synced": 0, "error": 0}
+
+    if args.interactive_sync:
+        sync_state = SyncState()
+        for i, m in enumerate(metadatas):
+            result = check_one(phoserv, m, args.flatten_namespace, args.include_pending, args.fix, sync_state)
+            counts[result] += 1
+            if sync_state.mode == "quit":
+                remaining = len(metadatas) - i - 1
+                if remaining:
+                    log(f"quit: skipping {remaining} remaining file(s)")
+                break
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = [
+                pool.submit(check_one, phoserv, m, args.flatten_namespace, args.include_pending, args.fix, None)
+                for m in metadatas
+            ]
+            for fut in as_completed(futures):
+                counts[fut.result()] += 1
 
     log(
         f"done. ok={counts['ok']} missing_tags={counts['missing']} "
-        f"not_uploaded={counts['not_uploaded']} errors={counts['error']}"
+        f"not_uploaded={counts['not_uploaded']} synced={counts['synced']} errors={counts['error']}"
     )
     return 1 if (counts["missing"] or counts["not_uploaded"] or counts["error"]) else 0
 
