@@ -7,6 +7,7 @@ mod gallery_tags;
 mod media;
 mod models;
 mod routes;
+mod search;
 mod storage;
 mod tags;
 

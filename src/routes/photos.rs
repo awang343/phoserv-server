@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::models::{Photo, PhotoRow, PHOTO_COLUMNS};
-use crate::{media, storage, tags, AppState};
+use crate::{media, search, storage, tags, AppState};
 
 fn extension_for(filename: &str, mime_type: &str) -> String {
     if let Some(ext) = StdPath::new(filename).extension().and_then(|e| e.to_str()) {
@@ -148,7 +148,10 @@ pub async fn upload(
 
 #[derive(Deserialize)]
 pub struct ListQuery {
-    tag: Option<String>,
+    /// Boolean search query over tags (AND/OR/NOT, `-tag` shorthand,
+    /// parentheses for grouping — see `search::parse`). Missing or empty
+    /// matches every photo. Parsed and evaluated entirely server-side.
+    q: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
     #[serde(default)]
@@ -186,105 +189,59 @@ pub async fn list(
 
     // Trashed photos (tagged with the reserved `trash` tag) are excluded from
     // every normal view; `?trash=true` flips that to show only trash
-    // contents, ignoring any `?tag` filter.
+    // contents, ignoring any `?q` filter.
     let trash_tag_id = tags::trash_tag_id(&state.pool).await?;
-    let exclude_tag_id: Option<i64> = if q.trash { None } else { trash_tag_id };
 
-    let tag_ids: Option<Vec<i64>> = if q.trash {
-        Some(trash_tag_id.into_iter().collect())
+    let (filter_sql, filter_binds): (String, Vec<i64>) = if q.trash {
+        match trash_tag_id {
+            Some(id) => (
+                "EXISTS (SELECT 1 FROM photo_tags pt_trash WHERE pt_trash.photo_id = p.id AND pt_trash.tag_id = ?)"
+                    .to_string(),
+                vec![id],
+            ),
+            None => ("0=1".to_string(), vec![]),
+        }
     } else {
-        match &q.tag {
-            Some(path) => match tags::find_by_path(&state.pool, path).await? {
-                Some(id) => Some(tags::descendant_ids(&state.pool, id).await?),
-                None => Some(vec![]),
-            },
-            None => None,
-        }
+        let expr = search::parse(q.q.as_deref().unwrap_or("")).map_err(AppError::bad_request)?;
+        let ids_by_term = search::resolve_terms(&state.pool, &expr).await?;
+        search::build_sql(&expr, &ids_by_term)
     };
 
-    let (mut rows, total): (Vec<PhotoRow>, i64) = match &tag_ids {
-        Some(ids) if ids.is_empty() => (vec![], 0),
-        Some(ids) => {
-            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let exclude_sql = if exclude_tag_id.is_some() {
-                "AND NOT EXISTS (SELECT 1 FROM photo_tags ptx WHERE ptx.photo_id = p.id AND ptx.tag_id = ?)"
-            } else {
-                ""
-            };
+    let mut base_conditions = vec![filter_sql];
+    let mut base_binds = filter_binds;
+    if !q.trash && let Some(id) = trash_tag_id {
+        base_conditions.push(
+            "NOT EXISTS (SELECT 1 FROM photo_tags pt_extrash WHERE pt_extrash.photo_id = p.id AND pt_extrash.tag_id = ?)"
+                .to_string(),
+        );
+        base_binds.push(id);
+    }
+    let base_where = format!("WHERE {}", base_conditions.join(" AND "));
 
-            let count_query = format!(
-                "SELECT COUNT(DISTINCT p.id) FROM photos p JOIN photo_tags pt ON pt.photo_id = p.id WHERE pt.tag_id IN ({placeholders}) {exclude_sql}"
-            );
-            let mut cq = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(count_query));
-            for id in ids {
-                cq = cq.bind(id);
-            }
-            if let Some(ex) = exclude_tag_id {
-                cq = cq.bind(ex);
-            }
-            let (total,) = cq.fetch_one(&state.pool).await?;
+    let count_query = format!("SELECT COUNT(*) FROM photos p {base_where}");
+    let mut cq = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(count_query));
+    for id in &base_binds {
+        cq = cq.bind(id);
+    }
+    let (total,) = cq.fetch_one(&state.pool).await?;
 
-            let cursor_sql = if cursor.is_some() { format!("AND ({cursor_clause})") } else { String::new() };
-            let list_query = format!(
-                "SELECT DISTINCT p.{} FROM photos p JOIN photo_tags pt ON pt.photo_id = p.id WHERE pt.tag_id IN ({placeholders}) {exclude_sql} {cursor_sql} ORDER BY p.created_at DESC, p.id DESC LIMIT ?",
-                PHOTO_COLUMNS.replace(", ", ", p.")
-            );
-            let mut lq = sqlx::query_as::<_, PhotoRow>(sqlx::AssertSqlSafe(list_query));
-            for id in ids {
-                lq = lq.bind(id);
-            }
-            if let Some(ex) = exclude_tag_id {
-                lq = lq.bind(ex);
-            }
-            if let Some((created_at, id)) = &cursor {
-                lq = lq.bind(created_at).bind(created_at).bind(id);
-            }
-            let rows = lq.bind(fetch_limit).fetch_all(&state.pool).await?;
-            (rows, total)
-        }
-        None => {
-            let exclude_sql = if exclude_tag_id.is_some() {
-                "NOT EXISTS (SELECT 1 FROM photo_tags ptx WHERE ptx.photo_id = photos.id AND ptx.tag_id = ?)"
-            } else {
-                ""
-            };
-            let mut conditions: Vec<&str> = Vec::new();
-            if exclude_tag_id.is_some() {
-                conditions.push(exclude_sql);
-            }
-            if cursor.is_some() {
-                conditions.push(cursor_clause);
-            }
-            let where_sql = if conditions.is_empty() {
-                String::new()
-            } else {
-                format!("WHERE {}", conditions.join(" AND "))
-            };
-
-            let count_query = format!("SELECT COUNT(*) FROM photos {}", if exclude_tag_id.is_some() {
-                format!("WHERE {exclude_sql}")
-            } else {
-                String::new()
-            });
-            let mut cq = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(count_query));
-            if let Some(ex) = exclude_tag_id {
-                cq = cq.bind(ex);
-            }
-            let (total,) = cq.fetch_one(&state.pool).await?;
-
-            let mut lq = sqlx::query_as::<_, PhotoRow>(sqlx::AssertSqlSafe(format!(
-                "SELECT {PHOTO_COLUMNS} FROM photos {where_sql} ORDER BY created_at DESC, id DESC LIMIT ?"
-            )));
-            if let Some(ex) = exclude_tag_id {
-                lq = lq.bind(ex);
-            }
-            if let Some((created_at, id)) = &cursor {
-                lq = lq.bind(created_at).bind(created_at).bind(id);
-            }
-            let rows = lq.bind(fetch_limit).fetch_all(&state.pool).await?;
-            (rows, total)
-        }
-    };
+    let mut list_conditions = base_conditions.clone();
+    if cursor.is_some() {
+        list_conditions.push(cursor_clause.to_string());
+    }
+    let list_where = format!("WHERE {}", list_conditions.join(" AND "));
+    let list_query = format!(
+        "SELECT p.{} FROM photos p {list_where} ORDER BY p.created_at DESC, p.id DESC LIMIT ?",
+        PHOTO_COLUMNS.replace(", ", ", p.")
+    );
+    let mut lq = sqlx::query_as::<_, PhotoRow>(sqlx::AssertSqlSafe(list_query));
+    for id in &base_binds {
+        lq = lq.bind(id);
+    }
+    if let Some((created_at, id)) = &cursor {
+        lq = lq.bind(created_at).bind(created_at).bind(id);
+    }
+    let mut rows = lq.bind(fetch_limit).fetch_all(&state.pool).await?;
 
     let has_more = rows.len() as i64 > limit;
     rows.truncate(limit as usize);
