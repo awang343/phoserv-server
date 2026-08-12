@@ -29,24 +29,26 @@ pub async fn resolve_or_create(pool: &SqlitePool, path: &str) -> anyhow::Result<
 
     let mut parent_id: i64 = 0;
     for segment in segments {
-        let existing: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM tags WHERE parent_id = ? AND name = ?")
-                .bind(parent_id)
-                .bind(segment)
-                .fetch_optional(pool)
-                .await?;
+        // Concurrent requests can race to create the same not-yet-existing
+        // segment (e.g. two uploads both tagging "location/tokyo" for the
+        // first time). A plain SELECT-then-INSERT has a gap between the two
+        // statements where both requests see "missing" and both try to
+        // insert, so the loser hits the UNIQUE(parent_id, name) constraint.
+        // `ON CONFLICT DO NOTHING` makes the insert itself the atomic
+        // check-and-create, so the loser just no-ops instead of erroring,
+        // and the follow-up SELECT is guaranteed to find the winner's row.
+        sqlx::query("INSERT INTO tags (name, parent_id) VALUES (?, ?) ON CONFLICT (parent_id, name) DO NOTHING")
+            .bind(segment)
+            .bind(parent_id)
+            .execute(pool)
+            .await?;
 
-        parent_id = match existing {
-            Some((id,)) => id,
-            None => {
-                let result = sqlx::query("INSERT INTO tags (name, parent_id) VALUES (?, ?)")
-                    .bind(segment)
-                    .bind(parent_id)
-                    .execute(pool)
-                    .await?;
-                result.last_insert_rowid()
-            }
-        };
+        let (id,): (i64,) = sqlx::query_as("SELECT id FROM tags WHERE parent_id = ? AND name = ?")
+            .bind(parent_id)
+            .bind(segment)
+            .fetch_one(pool)
+            .await?;
+        parent_id = id;
     }
     Ok(parent_id)
 }
