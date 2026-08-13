@@ -15,12 +15,14 @@ downloaders_path in config.toml and DownloaderPanel in the web app):
     failure are still imported.
 
 Tags are derived from gallery-dl's own per-file metadata (written via
---write-metadata as a "<file>.json" sidecar next to each download):
+--write-metadata as a "<file>.json" sidecar next to each download). Only
+four are emitted, each only when the site's extractor actually reports the
+underlying field:
 
-  * source/<category>              e.g. source/twitter, source/danbooru
-  * source/<category>/<subcategory> when gallery-dl reports a distinct one
-  * artist/<name>                  from the first of artist/author/uploader/user/creator
-  * booru/<tag>                    one per entry in a site's native tag list, if any
+  * source/<category>              extractor name, e.g. source/twitter, source/danbooru
+  * source_gallery/<gallery_id>    the gallery/album/set id, for sites with that concept
+  * source_id/<unique_id>          the specific post/image's own unique id
+  * source_creator/<uploader>      the artist/author/uploader
 
 Requires: pip install gallery-dl
 """
@@ -35,12 +37,12 @@ from pathlib import Path
 
 METADATA_SUFFIX = ".json"
 
-# Metadata keys gallery-dl's various extractors use for the uploader/artist,
-# checked in order -- first non-empty match wins.
-ARTIST_KEYS = ("artist", "author", "uploader", "user", "creator")
-
-# Metadata keys commonly holding a site's own list of tags.
-TAG_LIST_KEYS = ("tags", "tag_string")
+# Metadata keys checked in order for each tag -- first non-empty match wins.
+# Field names aren't standardized across gallery-dl's extractors, so each
+# tuple lists every name commonly seen for that concept.
+GALLERY_ID_KEYS = ("gallery_id", "album_id", "set_id")
+UNIQUE_ID_KEYS = ("id", "post_id", "illust_id", "tweet_id", "pid")
+CREATOR_KEYS = ("artist", "author", "uploader", "user", "creator")
 
 
 def log(msg: str) -> None:
@@ -55,32 +57,40 @@ def find_gallery_dl() -> str:
     return exe
 
 
+def first_value(metadata: dict, keys: tuple[str, ...]) -> str | None:
+    """Returns the first non-empty value found under `keys`, as a string.
+    Some extractors report these as nested dicts (e.g. a Twitter author is
+    `{"name": ..., "nick": ..., "id": ...}`) rather than a plain string."""
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("nick") or value.get("id")
+        if value is None:
+            continue
+        value = str(value).strip()
+        if value:
+            return value
+    return None
+
+
 def build_tags(metadata: dict) -> list[str]:
     tags: list[str] = []
 
     category = metadata.get("category")
-    subcategory = metadata.get("subcategory")
     if category:
         tags.append(f"source/{category}")
-        if subcategory and subcategory != category:
-            tags.append(f"source/{category}/{subcategory}")
 
-    for key in ARTIST_KEYS:
-        value = metadata.get(key)
-        if isinstance(value, str) and value.strip():
-            tags.append(f"artist/{value.strip()}")
-            break
+    gallery_id = first_value(metadata, GALLERY_ID_KEYS)
+    if gallery_id:
+        tags.append(f"source_gallery/{gallery_id}")
 
-    for key in TAG_LIST_KEYS:
-        value = metadata.get(key)
-        if isinstance(value, str):
-            value = value.split()
-        if isinstance(value, list):
-            for tag in value:
-                tag = str(tag).strip()
-                if tag:
-                    tags.append(f"booru/{tag}")
-            break
+    unique_id = first_value(metadata, UNIQUE_ID_KEYS)
+    if unique_id:
+        tags.append(f"source_id/{unique_id}")
+
+    creator = first_value(metadata, CREATOR_KEYS)
+    if creator:
+        tags.append(f"source_creator/{creator}")
 
     return tags
 
