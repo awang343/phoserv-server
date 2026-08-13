@@ -4,6 +4,7 @@ mod db;
 mod error;
 mod gallery;
 mod gallery_tags;
+mod ingest;
 mod media;
 mod models;
 mod routes;
@@ -27,6 +28,7 @@ use tower_http::trace::TraceLayer;
 pub struct AppState {
     pub pool: SqlitePool,
     pub config: Arc<config::ServerConfig>,
+    pub jobs: routes::downloaders::JobStore,
 }
 
 #[tokio::main]
@@ -56,7 +58,7 @@ async fn run_server(config: config::ServerConfig) -> anyhow::Result<()> {
     tracing::info!("using library at {}", config.library_path.display());
 
     let pool = db::connect(&config.library_path).await?;
-    let state = AppState { pool, config: Arc::new(config) };
+    let state = AppState { pool, config: Arc::new(config), jobs: Default::default() };
 
     let api = routes::router()
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_token));

@@ -8,6 +8,10 @@ pub struct Config {
     pub host: String,
     pub api_token: String,
     pub libraries: Vec<LibraryConfig>,
+    /// Directory of executable downloader scripts the web app can offer to
+    /// run (see `routes::downloaders`). Optional — the downloaders API
+    /// returns an empty list / errors clearly if unset.
+    pub downloaders_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -28,6 +32,7 @@ pub struct ServerConfig {
     pub port: u16,
     pub api_token: String,
     pub library_path: PathBuf,
+    pub downloaders_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -74,6 +79,16 @@ impl Config {
             library.library_path = library.library_path.canonicalize()?;
         }
 
+        if let Some(downloaders_path) = &mut config.downloaders_path {
+            if !downloaders_path.is_absolute() {
+                anyhow::bail!("downloaders_path in config must be an absolute path");
+            }
+            if !downloaders_path.is_dir() {
+                anyhow::bail!("downloaders_path {} does not exist or is not a directory", downloaders_path.display());
+            }
+            *downloaders_path = downloaders_path.canonicalize()?;
+        }
+
         Ok(config)
     }
 
@@ -85,6 +100,7 @@ impl Config {
                 port: library.port,
                 api_token: self.api_token.clone(),
                 library_path: library.library_path,
+                downloaders_path: self.downloaders_path.clone(),
             })
             .collect()
     }

@@ -1,3 +1,4 @@
+pub mod downloaders;
 mod galleries;
 mod photos;
 mod tags;
@@ -43,4 +44,7 @@ pub fn router() -> Router<AppState> {
             "/api/gallery-tags/{id}",
             patch(galleries::rename_tag).delete(galleries::delete_tag),
         )
+        .route("/api/downloaders", get(downloaders::list))
+        .route("/api/downloaders/{name}/run", post(downloaders::run))
+        .route("/api/downloaders/jobs/{id}", get(downloaders::job_status))
 }
