@@ -91,13 +91,13 @@ pub async fn list(
     let cursor = q.cursor.as_deref().map(decode_cursor).transpose()?;
     let cursor_clause = "created_at < ? OR (created_at = ? AND id < ?)";
 
-    // Trashed photos (tagged with the reserved `trash` tag) are excluded from
-    // every normal view; `?trash=true` flips that to show only trash
-    // contents, ignoring any `?q` filter.
-    let trash_tag_id = tags::trash_tag_id(&state.pool).await?;
-
+    // `?trash=true` restricts the view to only trashed photos (tagged with
+    // the reserved `trash` tag), ignoring any `?q` filter — used by the
+    // dedicated Trash tab for review/permanent-delete. Every other view,
+    // including plain `?q` searches, shows trashed photos inline alongside
+    // everything else; the frontend marks them with a trash icon.
     let (filter_sql, filter_binds): (String, Vec<i64>) = if q.trash {
-        match trash_tag_id {
+        match tags::trash_tag_id(&state.pool).await? {
             Some(id) => (
                 "EXISTS (SELECT 1 FROM photo_tags pt_trash WHERE pt_trash.photo_id = p.id AND pt_trash.tag_id = ?)"
                     .to_string(),
@@ -111,15 +111,8 @@ pub async fn list(
         search::build_sql(&expr, &ids_by_term)
     };
 
-    let mut base_conditions = vec![filter_sql];
-    let mut base_binds = filter_binds;
-    if !q.trash && let Some(id) = trash_tag_id {
-        base_conditions.push(
-            "NOT EXISTS (SELECT 1 FROM photo_tags pt_extrash WHERE pt_extrash.photo_id = p.id AND pt_extrash.tag_id = ?)"
-                .to_string(),
-        );
-        base_binds.push(id);
-    }
+    let base_conditions = vec![filter_sql];
+    let base_binds = filter_binds;
     let base_where = format!("WHERE {}", base_conditions.join(" AND "));
 
     let count_query = format!("SELECT COUNT(*) FROM photos p {base_where}");

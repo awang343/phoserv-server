@@ -259,9 +259,10 @@ pub async fn delete(pool: &SqlitePool, tag_id: i64) -> Result<(), DeleteError> {
 }
 
 /// Computes, for every tag, the number of distinct photos tagged with that
-/// tag or any of its descendants. Done as a single recursive-CTE query
-/// (rather than one query per tag) so the cost stays flat as the tag tree
-/// grows; `idx_photo_tags_tag` keeps the join cheap.
+/// tag or any of its descendants (trashed photos included, since the library
+/// now shows them inline too). Done as a single recursive-CTE query (rather
+/// than one query per tag) so the cost stays flat as the tag tree grows;
+/// `idx_photo_tags_tag` keeps the join cheap.
 async fn photo_counts(pool: &SqlitePool) -> anyhow::Result<HashMap<i64, i64>> {
     let rows: Vec<(i64, i64)> = sqlx::query_as(
         r#"
