@@ -1,14 +1,17 @@
-use std::path::Path as StdPath;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path as StdPath, PathBuf};
 
 use axum::body::Body;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
+use walkdir::WalkDir;
 
 use crate::error::AppError;
 use crate::models::{Photo, PhotoRow, PHOTO_COLUMNS};
@@ -26,36 +29,20 @@ fn extension_for(filename: &str, mime_type: &str) -> String {
         .unwrap_or_else(|| "bin".to_string())
 }
 
-pub async fn upload(
-    State(state): State<AppState>,
-    mut multipart: Multipart,
-) -> Result<(StatusCode, Json<Photo>), AppError> {
-    let mut file_bytes: Option<Vec<u8>> = None;
-    let mut filename: Option<String> = None;
-    let mut content_type: Option<String> = None;
-    let mut tag_paths: Vec<String> = Vec::new();
-
-    while let Some(field) = multipart.next_field().await.map_err(|e| AppError::bad_request(e.to_string()))? {
-        let name = field.name().unwrap_or("").to_string();
-        match name.as_str() {
-            "file" => {
-                filename = field.file_name().map(|s| s.to_string());
-                content_type = field.content_type().map(|s| s.to_string());
-                file_bytes = Some(field.bytes().await.map_err(|e| AppError::bad_request(e.to_string()))?.to_vec());
-            }
-            "tags" => {
-                let value = field.text().await.map_err(|e| AppError::bad_request(e.to_string()))?;
-                if !value.trim().is_empty() {
-                    tag_paths.push(value);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let bytes = file_bytes.ok_or_else(|| AppError::bad_request("missing file field"))?;
-    let filename = filename.unwrap_or_else(|| "upload".to_string());
-
+/// Stores `bytes` as a photo (deduping by content hash, same as everywhere
+/// else) and attaches `tag_paths` to it, creating any missing tag segments.
+/// Shared by the multipart `upload` handler and `import_path`, which reads
+/// bytes off disk instead of out of a multipart body. Returns the resulting
+/// photo, whether a new photo row was created (vs. an existing one being
+/// found by hash), and which of `tag_paths` were newly attached (i.e. not
+/// already on the photo).
+async fn ingest(
+    state: &AppState,
+    filename: String,
+    content_type: Option<String>,
+    bytes: Vec<u8>,
+    tag_paths: &[String],
+) -> Result<(Photo, bool, Vec<String>), AppError> {
     let mime_type = content_type
         .filter(|c| !c.is_empty() && c != "application/octet-stream")
         .or_else(|| mime_guess::from_path(&filename).first().map(|m| m.to_string()))
@@ -78,6 +65,8 @@ pub async fn upload(
     .bind(&hash)
     .fetch_optional(&state.pool)
     .await?;
+
+    let created = existing.is_none();
 
     let photo_row = match existing {
         Some(row) => row,
@@ -133,7 +122,13 @@ pub async fn upload(
         }
     };
 
-    for path in &tag_paths {
+    let tags_before: std::collections::HashSet<String> = if created {
+        Default::default()
+    } else {
+        tags::tags_for_photo(&state.pool, &photo_row.id).await?.into_iter().collect()
+    };
+
+    for path in tag_paths {
         let tag_id = tags::resolve_or_create(&state.pool, path).await?;
         sqlx::query("INSERT OR IGNORE INTO photo_tags (photo_id, tag_id) VALUES (?, ?)")
             .bind(&photo_row.id)
@@ -143,7 +138,43 @@ pub async fn upload(
     }
 
     let tag_list = tags::tags_for_photo(&state.pool, &photo_row.id).await?;
-    Ok((StatusCode::CREATED, Json(Photo::from_row(photo_row, tag_list))))
+    let tags_added: Vec<String> = tag_paths.iter().filter(|t| !tags_before.contains(t.as_str())).cloned().collect();
+
+    Ok((Photo::from_row(photo_row, tag_list), created, tags_added))
+}
+
+pub async fn upload(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<Photo>), AppError> {
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut filename: Option<String> = None;
+    let mut content_type: Option<String> = None;
+    let mut tag_paths: Vec<String> = Vec::new();
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| AppError::bad_request(e.to_string()))? {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "file" => {
+                filename = field.file_name().map(|s| s.to_string());
+                content_type = field.content_type().map(|s| s.to_string());
+                file_bytes = Some(field.bytes().await.map_err(|e| AppError::bad_request(e.to_string()))?.to_vec());
+            }
+            "tags" => {
+                let value = field.text().await.map_err(|e| AppError::bad_request(e.to_string()))?;
+                if !value.trim().is_empty() {
+                    tag_paths.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let bytes = file_bytes.ok_or_else(|| AppError::bad_request("missing file field"))?;
+    let filename = filename.unwrap_or_else(|| "upload".to_string());
+
+    let (photo, ..) = ingest(&state, filename, content_type, bytes, &tag_paths).await?;
+    Ok((StatusCode::CREATED, Json(photo)))
 }
 
 #[derive(Deserialize)]
@@ -534,4 +565,262 @@ pub async fn bulk_delete_permanently(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A `(regex, template)` pair for deriving a tag from a file's complete path.
+/// `template` is rendered with `{name}` placeholders filled in from the
+/// regex's named/numbered capture groups plus the built-in `{filename}`,
+/// `{stem}` and `{parent}` fields; a placeholder with no matching field
+/// fails the whole rule (for that file) rather than silently dropping it.
+struct TagRule {
+    regex: Regex,
+    template: String,
+}
+
+impl TagRule {
+    fn new(pattern: &str, template: &str) -> Result<Self, regex::Error> {
+        Ok(TagRule { regex: Regex::new(pattern)?, template: template.to_string() })
+    }
+
+    fn apply(&self, path: &str, filename: &str, stem: &str, parent: &str) -> Option<String> {
+        let caps = self.regex.captures(path)?;
+
+        let mut fields: HashMap<String, String> = HashMap::new();
+        fields.insert("filename".to_string(), filename.to_string());
+        fields.insert("stem".to_string(), stem.to_string());
+        fields.insert("parent".to_string(), parent.to_string());
+        for (i, group) in caps.iter().enumerate().skip(1) {
+            if let Some(m) = group {
+                fields.insert(i.to_string(), m.as_str().to_string());
+            }
+        }
+        for name in self.regex.capture_names().flatten() {
+            if let Some(m) = caps.name(name) {
+                fields.insert(name.to_string(), m.as_str().to_string());
+            }
+        }
+
+        match render_template(&self.template, &fields) {
+            Ok(tag) => Some(tag),
+            Err(missing) => {
+                tracing::warn!(
+                    "tag-rule template {:?} references missing field {missing:?} for {path}",
+                    self.template
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Renders `{field}`-style placeholders in `template` from `fields`. Returns
+/// the name of the first placeholder that has no matching field, if any.
+fn render_template(template: &str, fields: &HashMap<String, String>) -> Result<String, String> {
+    let mut result = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        result.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        let close = after_open.find('}').ok_or_else(|| "unclosed '{'".to_string())?;
+        let key = &after_open[..close];
+        let value = fields.get(key).ok_or_else(|| key.to_string())?;
+        result.push_str(value);
+        rest = &after_open[close + 1..];
+    }
+    result.push_str(rest);
+    Ok(result)
+}
+
+#[derive(Deserialize)]
+pub struct TagRuleSpec {
+    pattern: String,
+    template: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+pub struct ImportPathBody {
+    /// Absolute path on the server's filesystem to scan; may be a single
+    /// file or a directory.
+    path: String,
+    #[serde(default = "default_true")]
+    recursive: bool,
+    /// Fixed tags applied to every imported file.
+    #[serde(default)]
+    tags: Vec<String>,
+    /// Regex/template pairs matched against each file's full path to derive
+    /// additional tags — see `TagRule`.
+    #[serde(default)]
+    tag_rules: Vec<TagRuleSpec>,
+    #[serde(default)]
+    lowercase_tags: bool,
+    /// When true, computes and returns tags/status without touching disk or
+    /// the database.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Serialize)]
+pub struct ImportFileResult {
+    path: String,
+    status: &'static str,
+    tags: Vec<String>,
+    photo_id: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Serialize, Default)]
+pub struct ImportSummary {
+    scanned: usize,
+    uploaded: usize,
+    tagged: usize,
+    skipped: usize,
+    errors: usize,
+}
+
+#[derive(Serialize)]
+pub struct ImportPathResponse {
+    results: Vec<ImportFileResult>,
+    summary: ImportSummary,
+}
+
+/// Recursively (unless `recursive: false`) walks `root` and returns every
+/// regular file found. Runs on a blocking thread since directory walking is
+/// synchronous I/O.
+async fn collect_files(root: PathBuf, recursive: bool) -> Result<Vec<PathBuf>, AppError> {
+    tokio::task::spawn_blocking(move || {
+        let mut walker = WalkDir::new(&root);
+        if !recursive {
+            walker = walker.max_depth(1);
+        }
+        walker
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| entry.into_path())
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, anyhow::anyhow!(e)))
+}
+
+/// Imports every photo/video under a path *on the server's own filesystem*
+/// (as opposed to `upload`, which receives file bytes from the client). Tags
+/// are built from a fixed list plus any number of path-matched `tag_rules`.
+/// Files whose content hash already exists on the server aren't re-read into
+/// storage; only newly-missing tags are attached to the existing photo.
+pub async fn import_path(
+    State(state): State<AppState>,
+    Json(body): Json<ImportPathBody>,
+) -> Result<Json<ImportPathResponse>, AppError> {
+    let root = StdPath::new(&body.path);
+    if !root.is_absolute() {
+        return Err(AppError::bad_request("path must be an absolute filesystem path on the server"));
+    }
+    let root = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|e| AppError::bad_request(format!("cannot access path {}: {e}", body.path)))?;
+
+    let rules: Vec<TagRule> = body
+        .tag_rules
+        .iter()
+        .map(|r| TagRule::new(&r.pattern, &r.template))
+        .collect::<Result<_, regex::Error>>()
+        .map_err(|e| AppError::bad_request(format!("invalid tag-rule regex: {e}")))?;
+
+    let files = collect_files(root, body.recursive).await?;
+
+    let mut results = Vec::new();
+    let mut summary = ImportSummary::default();
+
+    for file_path in files {
+        let mime_type = mime_guess::from_path(&file_path).first().map(|m| m.to_string());
+        if mime_type.as_deref().and_then(media::MediaType::from_mime).is_none() {
+            continue;
+        }
+        summary.scanned += 1;
+
+        let path_str = file_path.to_string_lossy().into_owned();
+        let filename = file_path.file_name().and_then(|s| s.to_str()).unwrap_or("upload").to_string();
+        let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let parent = file_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        let mut tag_set: BTreeSet<String> = body.tags.iter().map(|t| t.trim().to_string()).collect();
+        for rule in &rules {
+            if let Some(tag) = rule.apply(&path_str, &filename, &stem, &parent) {
+                let tag = tag.trim().trim_matches('/').to_string();
+                if !tag.is_empty() {
+                    tag_set.insert(tag);
+                }
+            }
+        }
+        tag_set.remove("");
+        let tags: Vec<String> = if body.lowercase_tags {
+            tag_set.into_iter().map(|t| t.to_lowercase()).collect()
+        } else {
+            tag_set.into_iter().collect()
+        };
+
+        if body.dry_run {
+            results.push(ImportFileResult {
+                path: path_str,
+                status: "dry_run",
+                tags,
+                photo_id: None,
+                error: None,
+            });
+            continue;
+        }
+
+        let bytes = match tokio::fs::read(&file_path).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                summary.errors += 1;
+                results.push(ImportFileResult {
+                    path: path_str,
+                    status: "error",
+                    tags,
+                    photo_id: None,
+                    error: Some(e.to_string()),
+                });
+                continue;
+            }
+        };
+
+        match ingest(&state, filename, None, bytes, &tags).await {
+            Ok((photo, created, tags_added)) => {
+                let status = if created {
+                    summary.uploaded += 1;
+                    "uploaded"
+                } else if !tags_added.is_empty() {
+                    summary.tagged += 1;
+                    "tagged"
+                } else {
+                    summary.skipped += 1;
+                    "skipped"
+                };
+                results.push(ImportFileResult { path: path_str, status, tags, photo_id: Some(photo.id), error: None });
+            }
+            Err(e) => {
+                summary.errors += 1;
+                results.push(ImportFileResult {
+                    path: path_str,
+                    status: "error",
+                    tags,
+                    photo_id: None,
+                    error: Some(e.1.to_string()),
+                });
+            }
+        }
+    }
+
+    Ok(Json(ImportPathResponse { results, summary }))
 }
