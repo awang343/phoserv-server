@@ -65,18 +65,33 @@ class PhoservClient:
         r.raise_for_status()
 
 
+def count_tags(nodes: list[dict]) -> int:
+    return sum(1 + count_tags(n["children"]) for n in nodes)
+
+
 def find_unused_subtrees(phoserv: PhoservClient, tree: list[dict], workers: int) -> list[dict]:
     """Returns the topmost tag nodes whose entire subtree (the tag itself
     plus every descendant) has zero matching photos. Descendants of a node
     already in the result aren't checked or returned separately, since
     deleting their ancestor removes them too."""
+    # Upper bound on the number of checks: subtrees pruned early because an
+    # ancestor was already unused never get counted individually, so the
+    # progress bar's denominator is an upper bound, not an exact total.
+    total = count_tags(tree)
+    checked = 0
+
     unused: list[dict] = []
     frontier = list(tree)
 
     while frontier:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(phoserv.count_photos, node["path"]): node for node in frontier}
-            counts = {futures[fut]["path"]: fut.result() for fut in as_completed(futures)}
+            counts = {}
+            for fut in as_completed(futures):
+                node = futures[fut]
+                counts[node["path"]] = fut.result()
+                checked += 1
+                print(f"\rchecking tag usage... {checked}/{total}", end="", flush=True)
 
         next_frontier = []
         for node in frontier:
@@ -86,6 +101,7 @@ def find_unused_subtrees(phoserv: PhoservClient, tree: list[dict], workers: int)
                 next_frontier.extend(node["children"])
         frontier = next_frontier
 
+    print(flush=True)
     return unused
 
 
@@ -125,13 +141,13 @@ def main() -> int:
 
     deleted = 0
     failed = 0
-    for node in unused:
+    for i, node in enumerate(unused, start=1):
         try:
             phoserv.delete_tag(node["id"])
-            log(f"deleted {node['path']}")
+            log(f"[{i}/{len(unused)}] deleted {node['path']}")
             deleted += 1
         except requests.RequestException as e:
-            log(f"FAILED to delete {node['path']}: {e}")
+            log(f"[{i}/{len(unused)}] FAILED to delete {node['path']}: {e}")
             failed += 1
 
     log(f"done. deleted={deleted} failed={failed}")
