@@ -33,7 +33,10 @@ pub enum JobStatus {
 pub struct Job {
     pub id: String,
     pub script: String,
-    pub url: String,
+    pub urls: Vec<String>,
+    /// Index into `urls` of the one currently being processed; `None` once
+    /// every url has been run (or before the first one has started).
+    pub current_index: Option<usize>,
     pub status: JobStatus,
     pub log: Vec<String>,
     pub results: Vec<FileResult>,
@@ -110,7 +113,7 @@ fn resolve_script(state: &AppState, name: &str) -> Result<PathBuf, AppError> {
 
 #[derive(Deserialize)]
 pub struct RunBody {
-    url: String,
+    urls: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -118,29 +121,32 @@ pub struct RunResponse {
     job_id: String,
 }
 
-/// Kicks off a downloader script as a detached background job and returns
-/// immediately with its id; the web app polls `job_status` for progress. The
-/// script is invoked via argv (never through a shell), with the URL as its
-/// only argument and a fresh staging directory it should write files into.
+/// Kicks off a downloader script as a detached background job, once per url
+/// in sequence (never in parallel — each run gets its own staging directory
+/// and must finish before the next starts), and returns immediately with the
+/// job's id; the web app polls `job_status` for progress. The script is
+/// invoked via argv (never through a shell), with the url as its only
+/// argument and a fresh staging directory it should write files into.
 pub async fn run(
     State(state): State<AppState>,
     Path(name): Path<String>,
     Json(body): Json<RunBody>,
 ) -> Result<Json<RunResponse>, AppError> {
     let script = resolve_script(&state, &name)?;
-    let url = body.url.trim().to_string();
-    if url.is_empty() {
-        return Err(AppError::bad_request("url must not be empty"));
+    let urls: Vec<String> = body.urls.iter().map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect();
+    if urls.is_empty() {
+        return Err(AppError::bad_request("at least one url is required"));
     }
 
     let job_id = Uuid::new_v4().to_string();
-    let staging_dir = std::env::temp_dir().join(format!("phoserv-dl-{job_id}"));
-    tokio::fs::create_dir_all(&staging_dir).await?;
+    let staging_root = std::env::temp_dir().join(format!("phoserv-dl-{job_id}"));
+    tokio::fs::create_dir_all(&staging_root).await?;
 
     let job = Job {
         id: job_id.clone(),
         script: name,
-        url: url.clone(),
+        urls: urls.clone(),
+        current_index: Some(0),
         status: JobStatus::Running,
         log: Vec::new(),
         results: Vec::new(),
@@ -152,7 +158,7 @@ pub async fn run(
 
     let task_state = state.clone();
     let task_job_id = job_id.clone();
-    tokio::spawn(run_job(task_state, task_job_id, script, url, staging_dir));
+    tokio::spawn(run_job(task_state, task_job_id, script, urls, staging_root));
 
     Ok(Json(RunResponse { job_id }))
 }
@@ -178,6 +184,12 @@ fn record_result(state: &AppState, job_id: &str, result: FileResult) {
     }
 }
 
+fn set_current_index(state: &AppState, job_id: &str, index: Option<usize>) {
+    if let Some(job) = state.jobs.lock().unwrap().get_mut(job_id) {
+        job.current_index = index;
+    }
+}
+
 fn finish_job(state: &AppState, job_id: &str, status: JobStatus) {
     if let Some(job) = state.jobs.lock().unwrap().get_mut(job_id) {
         job.status = status;
@@ -196,14 +208,51 @@ struct ManifestLine {
     tags: Vec<String>,
 }
 
-/// Runs a downloader script to completion: streams its stdout (parsing
-/// manifest lines and ingesting the files they reference) and stderr into the
-/// job log, then marks the job finished and removes the staging directory.
-async fn run_job(state: AppState, job_id: String, script: PathBuf, url: String, staging_dir: PathBuf) {
-    let mut cmd = Command::new(&script);
-    cmd.arg(&url)
-        .env("PHOSERV_STAGING_DIR", &staging_dir)
-        .current_dir(&staging_dir)
+/// Runs the downloader script once per url, strictly in sequence (each run
+/// must finish before the next starts, since scripts write into a shared-name
+/// staging subdirectory and log to the same job). The job is marked failed if
+/// any url's run fails, but every url still gets a run regardless of earlier
+/// failures. Removes the whole staging tree once every url has been
+/// processed.
+async fn run_job(state: AppState, job_id: String, script: PathBuf, urls: Vec<String>, staging_root: PathBuf) {
+    let total = urls.len();
+    let mut any_failed = false;
+
+    for (index, url) in urls.iter().enumerate() {
+        set_current_index(&state, &job_id, Some(index));
+        append_log(&state, &job_id, format!("=== [{}/{total}] {url} ===", index + 1));
+
+        let staging_dir = staging_root.join(index.to_string());
+        if let Err(e) = tokio::fs::create_dir_all(&staging_dir).await {
+            append_log(&state, &job_id, format!("failed to create staging dir: {e}"));
+            any_failed = true;
+            continue;
+        }
+
+        let ok = run_one(&state, &job_id, &script, url, &staging_dir).await;
+        any_failed |= !ok;
+
+        if let Err(e) = tokio::fs::remove_dir_all(&staging_dir).await {
+            tracing::warn!("failed to clean up downloader staging dir {}: {e}", staging_dir.display());
+        }
+    }
+
+    set_current_index(&state, &job_id, None);
+    finish_job(&state, &job_id, if any_failed { JobStatus::Failed } else { JobStatus::Completed });
+    if let Err(e) = tokio::fs::remove_dir_all(&staging_root).await {
+        tracing::warn!("failed to clean up downloader staging dir {}: {e}", staging_root.display());
+    }
+}
+
+/// Runs the downloader script for a single url to completion, streaming its
+/// stdout (parsing manifest lines and ingesting the files they reference) and
+/// stderr into the job log. Returns whether the script started and exited
+/// successfully.
+async fn run_one(state: &AppState, job_id: &str, script: &StdPath, url: &str, staging_dir: &StdPath) -> bool {
+    let mut cmd = Command::new(script);
+    cmd.arg(url)
+        .env("PHOSERV_STAGING_DIR", staging_dir)
+        .current_dir(staging_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -211,10 +260,8 @@ async fn run_job(state: AppState, job_id: String, script: PathBuf, url: String, 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            append_log(&state, &job_id, format!("failed to start script: {e}"));
-            finish_job(&state, &job_id, JobStatus::Failed);
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return;
+            append_log(state, job_id, format!("failed to start script: {e}"));
+            return false;
         }
     };
 
@@ -222,8 +269,8 @@ async fn run_job(state: AppState, job_id: String, script: PathBuf, url: String, 
     let stderr = child.stderr.take().expect("child spawned with piped stderr");
 
     let stdout_state = state.clone();
-    let stdout_job_id = job_id.clone();
-    let stdout_staging = staging_dir.clone();
+    let stdout_job_id = job_id.to_string();
+    let stdout_staging = staging_dir.to_path_buf();
     let stdout_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -235,7 +282,7 @@ async fn run_job(state: AppState, job_id: String, script: PathBuf, url: String, 
     });
 
     let stderr_state = state.clone();
-    let stderr_job_id = job_id.clone();
+    let stderr_job_id = job_id.to_string();
     let stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -246,21 +293,16 @@ async fn run_job(state: AppState, job_id: String, script: PathBuf, url: String, 
     let _ = stdout_task.await;
     let _ = stderr_task.await;
 
-    let status = match child.wait().await {
-        Ok(status) if status.success() => JobStatus::Completed,
+    match child.wait().await {
+        Ok(status) if status.success() => true,
         Ok(status) => {
-            append_log(&state, &job_id, format!("script exited with {status}"));
-            JobStatus::Failed
+            append_log(state, job_id, format!("script exited with {status}"));
+            false
         }
         Err(e) => {
-            append_log(&state, &job_id, format!("failed to wait on script: {e}"));
-            JobStatus::Failed
+            append_log(state, job_id, format!("failed to wait on script: {e}"));
+            false
         }
-    };
-
-    finish_job(&state, &job_id, status);
-    if let Err(e) = tokio::fs::remove_dir_all(&staging_dir).await {
-        tracing::warn!("failed to clean up downloader staging dir {}: {e}", staging_dir.display());
     }
 }
 
