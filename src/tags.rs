@@ -258,14 +258,46 @@ pub async fn delete(pool: &SqlitePool, tag_id: i64) -> Result<(), DeleteError> {
     Ok(())
 }
 
+/// Computes, for every tag, the number of distinct photos tagged with that
+/// tag or any of its descendants. Done as a single recursive-CTE query
+/// (rather than one query per tag) so the cost stays flat as the tag tree
+/// grows; `idx_photo_tags_tag` keeps the join cheap.
+async fn photo_counts(pool: &SqlitePool) -> anyhow::Result<HashMap<i64, i64>> {
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
+        r#"
+        WITH RECURSIVE ancestors(tag_id, ancestor_id) AS (
+            SELECT id, id FROM tags WHERE id != 0
+            UNION ALL
+            SELECT a.tag_id, t.parent_id
+            FROM ancestors a
+            JOIN tags t ON t.id = a.ancestor_id
+            WHERE t.parent_id != 0
+        )
+        SELECT a.ancestor_id, COUNT(DISTINCT pt.photo_id)
+        FROM ancestors a
+        JOIN photo_tags pt ON pt.tag_id = a.tag_id
+        GROUP BY a.ancestor_id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
 pub async fn build_tree(pool: &SqlitePool) -> anyhow::Result<Vec<TagNode>> {
     let all = fetch_all_tags(pool).await?;
+    let counts = photo_counts(pool).await?;
     let mut children_of: HashMap<i64, Vec<&TagRow>> = HashMap::new();
     for tag in &all {
         children_of.entry(tag.parent_id).or_default().push(tag);
     }
 
-    fn build(parent_id: i64, parent_path: &str, children_of: &HashMap<i64, Vec<&TagRow>>) -> Vec<TagNode> {
+    fn build(
+        parent_id: i64,
+        parent_path: &str,
+        children_of: &HashMap<i64, Vec<&TagRow>>,
+        counts: &HashMap<i64, i64>,
+    ) -> Vec<TagNode> {
         let mut nodes = Vec::new();
         if let Some(children) = children_of.get(&parent_id) {
             for tag in children {
@@ -280,7 +312,8 @@ pub async fn build_tree(pool: &SqlitePool) -> anyhow::Result<Vec<TagNode>> {
                 nodes.push(TagNode {
                     id: tag.id,
                     name: tag.name.clone(),
-                    children: build(tag.id, &path, children_of),
+                    children: build(tag.id, &path, children_of, counts),
+                    count: counts.get(&tag.id).copied().unwrap_or(0),
                     path,
                 });
             }
@@ -289,5 +322,5 @@ pub async fn build_tree(pool: &SqlitePool) -> anyhow::Result<Vec<TagNode>> {
         nodes
     }
 
-    Ok(build(0, "", &children_of))
+    Ok(build(0, "", &children_of, &counts))
 }

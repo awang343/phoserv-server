@@ -57,6 +57,10 @@ pub struct TagNode {
     pub id: i64,
     pub name: String,
     pub path: String,
+    /// Number of distinct items (photos or galleries, depending on which
+    /// tag tree this node came from) tagged with this tag or any of its
+    /// descendants.
+    pub count: i64,
     pub children: Vec<TagNode>,
 }
 
