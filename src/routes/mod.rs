@@ -21,7 +21,7 @@ pub fn router() -> Router<AppState> {
             "/api/photos/{id}/tags",
             post(photos::add_tags).delete(photos::remove_tags),
         )
-        .route("/api/photos/tags", post(photos::bulk_add_tags))
+        .route("/api/photos/tags", post(photos::bulk_add_tags).delete(photos::bulk_remove_tags))
         .route("/api/photos/bulk-delete", post(photos::bulk_delete_permanently))
         .route("/api/tags", get(tags::tree))
         .route("/api/tags/{id}", patch(tags::rename).delete(tags::delete))

@@ -393,6 +393,28 @@ pub async fn bulk_add_tags(
     Ok(Json(fetch_photos(&state, &body.photo_ids).await?))
 }
 
+pub async fn bulk_remove_tags(
+    State(state): State<AppState>,
+    Json(body): Json<BulkTagsBody>,
+) -> Result<Json<Vec<Photo>>, AppError> {
+    let mut tag_ids = Vec::with_capacity(body.tags.len());
+    for path in &body.tags {
+        if let Some(tag_id) = tags::find_by_path(&state.pool, path).await? {
+            tag_ids.push(tag_id);
+        }
+    }
+    for id in &body.photo_ids {
+        for tag_id in &tag_ids {
+            sqlx::query("DELETE FROM photo_tags WHERE photo_id = ? AND tag_id = ?")
+                .bind(id)
+                .bind(tag_id)
+                .execute(&state.pool)
+                .await?;
+        }
+    }
+    Ok(Json(fetch_photos(&state, &body.photo_ids).await?))
+}
+
 #[derive(Deserialize)]
 pub struct BulkDeleteBody {
     photo_ids: Vec<String>,
